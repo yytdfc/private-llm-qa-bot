@@ -138,7 +138,7 @@ def generate_table_by_sql(llm, msg_list):
         sql = re.findall(r"<SQL>(.*?)</SQL>", sql, re.DOTALL|re.IGNORECASE)[0]
         df = duckdb.query(sql).to_df()
     except Exception:
-        sql_prefix = "SELECT opportunity_name, account_name, stage, sales_area, sales_group, description, next_step FROM opportunity_table"
+        sql = "SELECT opportunity_name, account_name, stage, sales_area, sales_group, description, next_step FROM opportunity_table"
         df = duckdb.query(sql).to_df()
 
     return df2csv(df)
