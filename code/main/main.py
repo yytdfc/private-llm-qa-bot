@@ -27,6 +27,9 @@ from utils.utils import add_reference, render_answer_with_ref
 from generator.llm_wrapper import get_langchain_llm_model, invoke_model, format_to_message
 from retriever.hybrid_retriever import CustomDocRetriever
 
+import pandas as pd
+import duckdb
+
 lambda_client= boto3.client('lambda')
 dynamodb_client = boto3.resource('dynamodb')
 region = boto3.Session().region_name
@@ -40,7 +43,7 @@ QA_SEP = "=>"
 A_Role="用户"
 B_Role="AWSBot"
 A_Role_en="user"
-SYSTEM_ROLE_PROMPT = '你是云服务AWS的智能客服机器人AWSBot'
+SYSTEM_ROLE_PROMPT = "You are a professional data analyst, please help me analyze the contents of the data in table."
 Fewshot_prefix_Q="问题"
 Fewshot_prefix_A="回答"
 RESET = '/rs'
@@ -70,6 +73,76 @@ BEDROCK_LLM_MODELID_LIST = {'claude-instant':'anthropic.claude-instant-v1',
                             'claude-v2':'anthropic.claude-v2',
                             'claude-v3-sonnet': 'anthropic.claude-3-sonnet-20240229-v1:0',
                             'claude-v3-haiku' : 'anthropic.claude-3-haiku-20240307-v1:0'}
+
+def get_query_prefix(mode="easy", cache={}, last_change=[0]):
+    # check every 60s
+    if time.time() - last_change[0] > 60 or mode not in cache:
+        # Create an S3 client
+        s3 = boto3.client('s3')
+        # Get the object from S3
+        try:
+            response = s3.get_object(Bucket="236995464743-24-04-03-09-16-52-bucket", Key=f"table_data/input_{mode}.txt")
+            cache[mode] = response['Body'].read().decode('utf-8')
+        except Exception as e:
+            print(f"Error getting object from S3: {e}")
+            return None
+        last_change[0] = time.time()
+    return cache[mode]
+
+def get_sql_prefix_and_table(cache={}, last_change=[0]):
+    # check every 60s
+    if time.time() - last_change[0] > 60 or "sql_prefix" not in cache or "table" not in cache:
+        # Create an S3 client
+        s3 = boto3.client('s3')
+        # Get the object from S3
+        TODAY = time.strftime("%Y-%m-%d",time.localtime(time.time()))
+        MONTH = str(int(time.strftime("%m",time.localtime(time.time()))))
+        YEAR = time.strftime("%Y",time.localtime(time.time()))
+        LAST_YEAR = str(int(time.strftime("%Y",time.localtime(time.time()))) - 1)
+        try:
+            response = s3.get_object(Bucket="236995464743-24-04-03-09-16-52-bucket", Key=f"table_data/input_sql.txt")
+            cache["sql_prefix"] = response['Body'].read().decode('utf-8')
+            cache["sql_prefix"] = cache["sql_prefix"].replace("[TODAY]", TODAY).replace("[MONTH]", MONTH).replace("[YEAR]", YEAR).replace("[LAST_YEAR]", LAST_YEAR)
+            response = s3.get_object(Bucket="236995464743-24-04-03-09-16-52-bucket", Key=f"table_data/opportunity.parquet")
+            cache["table"] = pd.read_parquet(io.BytesIO(response['Body'].read()))
+        except Exception as e:
+            print(f"Error getting object from S3: {e}")
+            return None
+        last_change[0] = time.time()
+    return cache["sql_prefix"], cache["table"]
+
+
+def df2csv(df):
+    csv = df.to_csv(index=False)
+    # remove nan
+    csv = csv.replace(",nan,", ",,")
+    csv = csv.replace(",nan,", ",,")
+    csv = csv.replace(",nan\n", ",\n")
+    csv = csv.replace("\nnan,", "\n,")
+    # remove useless blank
+    csv = csv.replace(" - ", "-").strip()
+    # add line num from 1, 2, ...
+    csvsp = csv.split("\n")
+    total = len(csvsp) - 1
+    csv = "\n".join([f"{i+1}, " + csvsp[i+1] for i in range(total)])
+    csv = f"(total {total} records)\n{csvsp[0]}\n" + csv + f"\n(total {total} records)"
+    return csv
+
+
+def generate_table_by_sql(llm, msg_list):
+    sql_prefix, opportunity_table = get_sql_prefix_and_table()
+    msg_list[0]["content"] = sql_prefix + msg_list[0]["content"]
+    sql = invoke_model(llm=llm, prompt=None, messages=msg_list).content
+    logger.info({"sql_prefix": sql_prefix})
+    try:
+        sql = re.findall(r"<SQL>(.*?)</SQL>", sql, re.DOTALL|re.IGNORECASE)[0]
+        df = duckdb.query(sql).to_df()
+    except Exception:
+        sql_prefix = "SELECT opportunity_name, account_name, stage, sales_area, sales_group, description, next_step FROM opportunity_table"
+        df = duckdb.query(sql).to_df()
+
+    return df2csv(df)
+
 
 ###记录跟踪日志，用于前端输出
 class TraceLogger(BaseModel):
@@ -597,6 +670,7 @@ def main_entry_new(user_id:str,wsconnection_id:str,session_id:str, query_input:s
 
     elpase_time = time.time() - start1
     logger.info(f'running time of get_session : {elpase_time}s seconds')
+
     answer = None
     query_type = None
     # free_chat_coversions = []
@@ -623,278 +697,55 @@ def main_entry_new(user_id:str,wsconnection_id:str,session_id:str, query_input:s
         chat_history = ''
         chat_history_msgs= []
 
+    ref_text = ""
+    recall_knowledge, opensearch_knn_respose, opensearch_query_response = [], [], []
 
-    
-    doc_retriever = CustomDocRetriever.from_endpoints(embedding_model_endpoint=embedding_model_endpoint,
-                                    aos_endpoint= aos_endpoint,
-                                    aos_index=aos_index)
-    
-    TRACE_LOGGER.trace(f'**Using LLM model : {llm_model_name}**')
-    cache_answer = None
-    if use_qa:
-        before_prefetch = time.time()
-        TRACE_LOGGER.trace(f'**Prefetching cache...**')
-        cache_repsonses = doc_retriever.knn_quick_prefetch(query_input=query_input, prefetch_threshold=KNN_QUICK_PEFETCH_THRESHOLD)
-        elpase_time_cache = time.time() - before_prefetch
-        TRACE_LOGGER.trace(f'**Running time of prefetching cache: {elpase_time_cache:.3f}s**')
-        if cache_repsonses:
-            last_cache = cache_repsonses[-1]['doc']
-            cache_answer = last_cache.split('\nAnswer:')[1]
-            TRACE_LOGGER.trace(f"**Found caches:**")
-            for sn,item in enumerate(cache_repsonses[::-1]):
-                TRACE_LOGGER.trace(f"**[{sn+1}] [{item['doc_title']}] [{item['doc_type']}] [{item['doc_classify']}] [{item['score']:.3f}] author:[{item['doc_author']}]**")
-                TRACE_LOGGER.trace(f"{item['doc']}")
-        else:
-            TRACE_LOGGER.trace(f"**No cache found**")
+    # for message api
+    sys_msg = {"role": "system", "content": SYSTEM_ROLE_PROMPT } if SYSTEM_ROLE_PROMPT else None
+    msg_list = [sys_msg, *chat_history_msgs] if sys_msg else [*chat_history_msgs]
+    msg = format_to_message(query=origin_query, image_base64_list=images_base64)
+    msg_list.append(msg)
+    mode = "easy" if use_qa else "hard"
+    content = msg_list[0]["content"]
+    logger.info([use_qa, origin_query])
 
-    detection = {'func': 'QA'}
-    intention = detection['func']
-    global INTENTION_LIST
-    other_intentions = INTENTION_LIST.split(',')
+    if mode == "easy":
+        msg_list[0]["content"] = get_query_prefix(mode) + content
+    elif mode == "hard":
+        llm4sql = get_langchain_llm_model(BEDROCK_LLM_MODELID_LIST['claude-v3-sonnet'], params, region)
+        table = generate_table_by_sql(llm4sql, msg_list)
+        msg_list[0]["content"] = get_query_prefix(mode).replace("[TABLE]", table) + content
 
-    ##如果使用QA，且没有cache answer再需要进一步意图判断
-    if use_qa and not cache_answer and len(other_intentions) > 0 and len(other_intentions[0]) > 1:
-        before_detect = time.time()
-        TRACE_LOGGER.trace(f'**Detecting intention...**')
-        detection = detect_intention(query_input,example_index, fewshot_cnt=5)
-        intention = detection['func']
-        elpase_time_detect = time.time() - before_detect
-        logger.info(f'detection: {detection}')
-        logger.info(f'running time of detecting : {elpase_time_detect:.3f}s')
-        TRACE_LOGGER.trace(f'**Running time of detecting: {elpase_time_detect:.3f}s**')
-        TRACE_LOGGER.trace(f'**Detected intention: {intention}**')
-    
-    if not use_qa:
-        intention = 'chat'
-
-    if cache_answer:
-        TRACE_LOGGER.trace('**Use Cache answer:**')
-        reply_stratgy = ReplyStratgy.OTHER
-        answer = cache_answer
-        if use_stream:
-            TRACE_LOGGER.postMessage(cache_answer)
-        recall_knowledge,opensearch_knn_respose,opensearch_query_response = [],[],[]
-    elif intention in ['comfort', 'transfer']:
-        reply_stratgy = ReplyStratgy.OTHER
-        TRACE_LOGGER.trace('**Answer:**')
-        answer = ''
-        if intention == 'comfort':
-            answer = "不好意思没能帮到您，是否帮你转人工客服？"
-        elif intention == 'transfer':
-            answer = '立即为您转人工客服，请稍后'
-        
-        if use_stream:
-            TRACE_LOGGER.postMessage(answer)
-
-        recall_knowledge,opensearch_knn_respose,opensearch_query_response = [],[],[]
-    elif intention in ['chat', 'assist']:##如果不使用QA
-        TRACE_LOGGER.trace(f'**Using Non-RAG {intention}...**')
-        TRACE_LOGGER.trace('**Answer:**')
-        reply_stratgy = ReplyStratgy.LLM_ONLY
-        prompt_template = None
-        answer = ''
-
-        # for message api
-        sys_msg = {"role": "system", "content": SYSTEM_ROLE_PROMPT } if SYSTEM_ROLE_PROMPT else None
-        msg_list = [sys_msg, *chat_history_msgs] if sys_msg else [*chat_history_msgs]
-        msg = format_to_message(query=origin_query, image_base64_list=images_base64)
-        msg_list.append(msg)
-
-        # for prompt api
-        prompt_template = create_chat_prompt_templete(llm_model_name=llm_model_name)
-        prompt = prompt_template.format(question=origin_query,role_bot=B_Role,chat_history=chat_history)
-
-        ai_reply = invoke_model(llm=llm, prompt=prompt, messages=msg_list, callbacks=[stream_callback])
-
-        final_prompt = json.dumps(msg_list,ensure_ascii=False)
+    try:
+        ai_reply = invoke_model(llm=llm, prompt=None, messages=msg_list, callbacks=[stream_callback])
         answer = ai_reply.content
-        
-        recall_knowledge,opensearch_knn_respose,opensearch_query_response = [],[],[]
-
-    elif intention == 'QA': ##如果使用QA
-        # 2. aos retriever
-        TRACE_LOGGER.trace('**Using RAG Chat...**')
-        
-
-        # doc_retriever = CustomDocRetriever.from_endpoints(embedding_model_endpoint=embedding_model_endpoint,
-        #                             aos_endpoint= aos_endpoint,
-        #                             aos_index=aos_index)
-        # 3. check is it keyword search
-        # exactly_match_result = aos_search(aos_endpoint, aos_index, "doc", query_input, exactly_match=True)
-        ## 精准匹配对paragraph类型文档不太适用，先屏蔽掉 
-        exactly_match_result = None
-
-        start = time.time()
-        ## 加上一轮的问题拼接来召回内容
-        # query_with_history= get_question_history(chat_coversions[-2:])+query_input
-        recall_knowledge = None
-        opensearch_knn_respose = []
-        opensearch_query_response = []
-        if KNOWLEDGE_BASE_ID:
-            TRACE_LOGGER.trace('**Retrieving knowledge from bedrock knowledgebase...**')
-            recall_knowledge = doc_retriever.get_relevant_documents_from_bedrock(
-                    knowledge_base_id=KNOWLEDGE_BASE_ID, 
-                    query_input=query_input, 
-                    top_k=TOP_K, 
-                    rerank_endpoint=CROSS_MODEL_ENDPOINT, 
-                    rerank_threshold=RERANK_THRESHOLD
-                )
-        else:
-            TRACE_LOGGER.trace('**Retrieving knowledge from OpenSearch...**')
-            recall_knowledge, opensearch_knn_respose, opensearch_query_response = doc_retriever.get_relevant_documents_custom(
-                query_input=query_input, 
-                channel_return_cnt=CHANNEL_RET_CNT, 
-                top_k=TOP_K, 
-                knn_threshold=KNN_QQ_THRESHOLD_HARD_REFUSE, 
-                bm25_threshold=BM25_QD_THRESHOLD_HARD_REFUSE, 
-                web_search_threshold=WEBSEARCH_THRESHOLD, 
-                use_search=use_search,
-                rerank_endpoint=CROSS_MODEL_ENDPOINT,
-                rerank_threshold=RERANK_THRESHOLD
-            ) 
-
-        elpase_time = time.time() - start
-        logger.info(f'running time of opensearch_query : {elpase_time:.3f}s seconds')
-        
-        reply_stratgy = get_reply_stratgy(recall_knowledge,refuse_strategy)
-        if reply_stratgy == ReplyStratgy.LLM_ONLY: 
-            recall_knowledge = []
-            
-        TRACE_LOGGER.trace(f'**Running time of retrieving knowledge : {elpase_time:.3f}s**')
-        TRACE_LOGGER.trace(f'**Retrieved {len(recall_knowledge)} knowledge:**')
-        TRACE_LOGGER.add_ref(f'\n\n**Refer to {len(recall_knowledge)} knowledge:**')
-
-        ##添加召回文档到refdoc和tracelog, 按score倒序展示
-        for sn,item in enumerate(recall_knowledge[::-1]):
-            TRACE_LOGGER.trace(f"**[{sn+1}] [{item['doc_title']}] [{item['doc_classify']}] [{item['score']:.3f}] [{item['rank_score']:.3f}] author:[ {item['doc_author']} ]**")
-            TRACE_LOGGER.trace(f"{item['doc']}")
-            TRACE_LOGGER.add_ref(f"**[{sn+1}] [{item['doc_title']}] [{item['doc_classify']}] [{item['score']:.3f}] [{item['rank_score']:.3f}] author:[ {item['doc_author']} ]**")
-            #doc 太长之后进行截断
-            TRACE_LOGGER.add_ref(f"{item['doc'][:500]}{'...' if len(item['doc'])>500 else ''}") 
-        TRACE_LOGGER.trace('**Answer:**')
-
-        if exactly_match_result and recall_knowledge:
-            answer = exactly_match_result[0]["doc"]
-            hide_ref= True ## 隐藏ref doc
-            if use_stream:
-                TRACE_LOGGER.postMessage(answer)
-                
-        elif reply_stratgy == ReplyStratgy.RETURN_OPTIONS:
-            some_reference, multi_choice_field = format_knowledges(recall_knowledge[::2])
-            answer = f"我不太确定，这有两条可能相关的信息，供参考：\n=====\n{some_reference}\n====="
-            hide_ref= True ## 隐藏ref doc
-            if use_stream:
-                TRACE_LOGGER.postMessage(answer)
-                
-        elif reply_stratgy == ReplyStratgy.SAY_DONT_KNOW:
-            answer = refuse_answer
-            hide_ref= True ## 隐藏ref doc
-            if use_stream:
-                TRACE_LOGGER.postMessage(answer)
-                
-        elif reply_stratgy == ReplyStratgy.LLM_ONLY: ##走LLM默认知识
-            # prompt_template = create_chat_prompt_templete()
-            # hide_ref= True ## 隐藏ref doc
-            # llmchain = LLMChain(llm=llm,verbose=verbose,prompt =prompt_template )
-            # ##最终的answer
-            # answer = llmchain.run({'question':query_input,'chat_history':chat_history,'role_bot':B_Role})
-            # ##最终的prompt日志
-            
-            # for message api
-            sys_msg = {"role": "system", "content": SYSTEM_ROLE_PROMPT } if SYSTEM_ROLE_PROMPT else None
-            msg_list = [sys_msg, *chat_history_msgs] if sys_msg else [*chat_history_msgs]
-            msg = format_to_message(query=origin_query, image_base64_list=images_base64)
-            msg_list.append(msg)
-
-            # for prompt api
-            prompt_template = create_chat_prompt_templete(llm_model_name=llm_model_name)
-            prompt = prompt_template.format(question=origin_query,role_bot=B_Role,chat_history=chat_history)
-
-            ai_reply = invoke_model(llm=llm, prompt=prompt, messages=msg_list, callbacks=[stream_callback])
-
-            final_prompt = json.dumps(msg_list,ensure_ascii=False)
-            answer = ai_reply.content
-            
-        else:      
-            prompt_template = create_qa_prompt_templete(template)
-            # llmchain = LLMChain(llm=llm,verbose=verbose,prompt =prompt_template )
-
-            # context = "\n".join([doc['doc'] for doc in recall_knowledge])
-            context, multi_choice_field = format_knowledges(recall_knowledge)
-            ask_user_prompts = [ f"- If you are not sure about which {field} user ask for, please ask user to clarify it before giving any answer, don't say anything else." for field in multi_choice_field ]
-            ask_user_prompts_str = "\n".join(ask_user_prompts)
-            if len(ask_user_prompts_str) > 0:
-                ask_user_prompts_str = f"\n{ask_user_prompts_str}\n"
-
-            try:
-                chat_history = '' ##QA 场景下先不使用history
-                prompt = prompt_template.format(question=query_input,role_bot=B_Role,context=context,chat_history=chat_history,ask_user_prompt=ask_user_prompts_str)
-                
-                sys_msg = {"role": "system", "content": SYSTEM_ROLE_PROMPT } if SYSTEM_ROLE_PROMPT else None
-                msg_list = [sys_msg, *chat_history_msgs] if sys_msg else [*chat_history_msgs]
-                msg = format_to_message(query=prompt, image_base64_list=images_base64)
-                msg_list.append(msg)
-
-                ai_reply = invoke_model(llm=llm, prompt=prompt, messages=msg_list, callbacks=[stream_callback])
-                final_prompt = json.dumps(msg_list,ensure_ascii=False)
-                answer = ai_reply.content
-            except Exception as e:
-                answer = str(e)
-    else:
-        #call agent for other intentions
-        TRACE_LOGGER.trace('**Using Agent...**')
-        reply_stratgy = ReplyStratgy.AGENT
-
-        answer,ref_doc = chat_agent(query_input, detection)
-        recall_knowledge,opensearch_knn_respose,opensearch_query_response = [ref_doc],[],[]
-        TRACE_LOGGER.add_ref(f'\n\n**Refer to {len(recall_knowledge)} knowledge:**')
-        TRACE_LOGGER.add_ref(f"**[1]** {ref_doc}")
-        TRACE_LOGGER.trace(f'**Function call result:**\n\n{ref_doc}')
-        TRACE_LOGGER.trace('**Answer:**')
+    except Exception as e:
+        answer = str(e)
         if use_stream:
             TRACE_LOGGER.postMessage(answer)
-
-    answer = enforce_stop_tokens(answer, STOP)
-    pattern = r'^根据[^，,]*[,|，]'
-    answer = re.sub(pattern, "", answer.strip())
-    ref_text = ''
-    # if not use_stream and recall_knowledge and hide_ref == False:
-        # ref_text = format_reference(recall_knowledge)
-    ref_text = TRACE_LOGGER.dump_refs(use_stream)
 
     json_obj = {
-        "query": query_input,
-        "origin_query" : origin_query,
-        "intention" : intention,
-        "opensearch_doc":  opensearch_query_response,
-        "opensearch_knn_doc":  opensearch_knn_respose,
+        "query": origin_query,
+        "opensearch_doc":  [],
+        "opensearch_knn_doc":  [],
         "kendra_doc": [],
-        "knowledges" : recall_knowledge,
-        "LLM_input": final_prompt,
-        "LLM_model_name": llm_model_name,
-        "reply_stratgy" : reply_stratgy.name,
-        "use_search":use_search,
-        "aos_index":aos_index,
+        "knowledges" : [],
+        "detect_query_type": '',
+        "LLM_input": '',
+        "use_search":use_search
     }
     json_obj['user_id'] = user_id
     json_obj['session_id'] = session_id
-    json_obj['msgid'] = msgid
-    json_obj['chatbot_answer'] = answer
-    json_obj['ref_docs'] = ref_text
-    json_obj['conversations'] = chat_coversions[-1:]
+    json_obj['chatbot_answer'] = str(answer)
+    json_obj['conversations'] = []
     json_obj['timestamp'] = int(time.time())
     json_obj['log_type'] = "all"
     json_obj_str = json.dumps(json_obj, ensure_ascii=False)
     logger.info(json_obj_str)
 
-    start = time.time()
-    if session_id != 'OnlyForDEBUG':
-        update_session(session_id=session_id,user_id=user_id, question=origin_query, answer=answer, intention=intention, msgid=msgid)
-    elpase_time = time.time() - start
-    elpase_time1 = time.time() - start1
-    logger.info(f'running time of update_session : {elpase_time}s seconds')
-    logger.info(f'running time of all  : {elpase_time1}s seconds')
-    return answer,ref_text,use_stream,query_input,opensearch_query_response,opensearch_knn_respose,recall_knowledge
+    update_session(session_id=session_id,user_id=user_id, question=origin_query, answer=answer, intention=intention, msgid=msgid)
+
+    return answer, ref_text, use_stream, query_input, opensearch_query_response, opensearch_knn_respose, recall_knowledge
 
 def get_s3_image_base64(bucket_name, key):
     # Create an S3 client
@@ -1067,9 +918,9 @@ def lambda_handler(event, context):
     logger.info(f'refuse_answer: {refuse_answer}')
     
     ##if aos and bedrock kb are null then set use_qa = false
-    if not aos_endpoint and not KNOWLEDGE_BASE_ID:
-        use_qa = False
-        logger.info(f'force set use_qa: {use_qa}')
+    # if not aos_endpoint and not KNOWLEDGE_BASE_ID:
+    #     use_qa = False
+    #     logger.info(f'force set use_qa: {use_qa}')
         
     global TRACE_LOGGER
     TRACE_LOGGER = TraceLogger(wsclient=wsclient,msgid=msgid,connectionId=wsconnection_id,stream=use_stream,use_trace=use_trace,hide_ref=hide_ref)

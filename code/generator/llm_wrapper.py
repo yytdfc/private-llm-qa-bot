@@ -1,4 +1,6 @@
 import boto3
+from botocore.client import Config as BotoConfig
+
 import json
 from typing import Any, Dict, List, Optional, Mapping
 import logging
@@ -64,8 +66,13 @@ def get_langchain_llm_model(llm_model_id, params, region, llm_stream=False, llm_
     parameters = { item[0]:item[1] for item in params.items() if item[0] in ['temperature','max_tokens', 'top_p', 'top_k', 'stop']}
 
     if llm_model_id in bedrock_llms:
+        TIMEOUT = 300
+
+        config = BotoConfig(connect_timeout=TIMEOUT, read_timeout=TIMEOUT)
+
         boto3_bedrock = boto3.client(
             service_name="bedrock-runtime",
+            config=config,
             region_name=region
         )
 

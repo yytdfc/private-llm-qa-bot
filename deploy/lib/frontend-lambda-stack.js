@@ -82,7 +82,7 @@ export class LambdaStack extends NestedStack {
       },
       runtime: lambda.Runtime.NODEJS_18_X,
       memorySize: 256,
-      timeout: Duration.minutes(1),
+      timeout: Duration.minutes(5),
     };
 
     this.login_fn = createNodeJsLambdaFn(

@@ -10,3 +10,6 @@ pytz
 google-api-python-client>=2.100.0
 aiohttp
 bs4
+pandas
+duckdb
+pyarrow
